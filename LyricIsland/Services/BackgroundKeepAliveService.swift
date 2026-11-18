@@ -46,12 +46,12 @@ final class BackgroundKeepAliveService {
         if isRunning, silentPlayer?.isPlaying == true { return }
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
             try session.setActive(true)
 
             if silentPlayer == nil {
                 let wavData = Self.makeSilentWavData(durationSeconds: 1.0, sampleRate: 8000)
-                let player = try AVAudioPlayer(data: wavData)
+                let player = try AVAudioPlayer(data: wavData, fileTypeHint: AVFileType.wav.rawValue)
                 player.numberOfLoops = -1
                 player.volume = 0.0
                 player.prepareToPlay()

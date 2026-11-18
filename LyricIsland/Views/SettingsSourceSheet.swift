@@ -3,7 +3,12 @@ import SwiftUI
 
 struct SettingsSourceSheet: View {
     @EnvironmentObject private var engine: LyricEngine
+    @ObservedObject private var spotify = SpotifySyncService.shared
     @Environment(\.dismiss) private var dismiss
+
+    @State private var clientIdInput: String = SpotifySyncService.shared.clientId
+    @State private var isConnectingSpotify = false
+    @State private var spotifyError: String?
 
     private var accent: Color {
         AcousticTheme.accentColor(from: engine.accentColorRGB)
@@ -63,6 +68,89 @@ struct SettingsSourceSheet: View {
                     }
                 }
 
+                Section {
+                    if spotify.isConnected {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("已連結 Spotify 帳號")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(AcousticTheme.textPrimary)
+                                Text(spotify.accountDisplayName.isEmpty ? "即時同步播放進度與切歌" : spotify.accountDisplayName)
+                                    .font(.caption)
+                                    .foregroundStyle(Color(red: 0.114, green: 0.725, blue: 0.329))
+                            }
+                            Spacer()
+                            Button("中斷連結") {
+                                engine.disconnectSpotify()
+                            }
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.red)
+                        }
+                        .listRowBackground(AcousticTheme.carbonSurface)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Spotify 帳號直連（免費 PKCE API）")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AcousticTheme.textPrimary)
+
+                            TextField("貼上 Spotify App Client ID", text: $clientIdInput)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .font(.system(size: 13, design: .monospaced))
+                                .padding(10)
+                                .background(AcousticTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    UIPasteboard.general.string = SpotifySyncService.redirectURI
+                                    engine.showToast("已複製 Redirect URI")
+                                } label: {
+                                    Text("複製回調 URI")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(AcousticTheme.textPrimary)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(AcousticTheme.elevatedSurface, in: Capsule())
+                                }
+
+                                Link("開啟 Spotify 控制台", destination: URL(string: "https://developer.spotify.com/dashboard")!)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(AcousticTheme.textSecondary)
+                            }
+
+                            Button {
+                                startSpotifyConnect()
+                            } label: {
+                                HStack {
+                                    if isConnectingSpotify {
+                                        ProgressView().tint(.black)
+                                    } else {
+                                        Text("授權登入 Spotify")
+                                            .font(.subheadline.weight(.bold))
+                                    }
+                                }
+                                .foregroundStyle(.black)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .background(Color(red: 0.114, green: 0.725, blue: 0.329), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+                            .disabled(clientIdInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isConnectingSpotify)
+
+                            if let spotifyError {
+                                Text(spotifyError)
+                                    .font(.caption2)
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        .listRowBackground(AcousticTheme.carbonSurface)
+                    }
+                } header: {
+                    Text("Spotify 同步設定")
+                } footer: {
+                    Text("於 developer.spotify.com 建立 App，將 Redirect URI 設為 \(SpotifySyncService.redirectURI)，即可直接讀取 Spotify 播放曲目與毫秒進度。或直接在「搜尋歌詞」貼上 Spotify 分享連結使用。")
+                }
+
                 Section("靈動島樣式") {
                     ForEach(IslandDisplayStyle.allCases) { style in
                         Button {
@@ -111,6 +199,10 @@ struct SettingsSourceSheet: View {
 
                 Section("iOS 快捷指令自動化 URL") {
                     urlCopyRow(
+                        title: "開啟懸浮歌詞窗",
+                        url: "lyricisland://pip"
+                    )
+                    urlCopyRow(
                         title: "一鍵啟動靈動歌詞",
                         url: "lyricisland://start"
                     )
@@ -132,6 +224,21 @@ struct SettingsSourceSheet: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func startSpotifyConnect() {
+        spotifyError = nil
+        isConnectingSpotify = true
+        Task {
+            do {
+                try await engine.connectSpotify(clientId: clientIdInput)
+                isConnectingSpotify = false
+                dismiss()
+            } catch {
+                spotifyError = error.localizedDescription
+                isConnectingSpotify = false
+            }
+        }
     }
 
     private func urlCopyRow(title: String, url: String) -> some View {

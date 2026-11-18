@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MainStageView: View {
     @EnvironmentObject private var engine: LyricEngine
+    @ObservedObject private var spotify = SpotifySyncService.shared
 
     @State private var showSearchSheet = false
     @State private var showSettingsSheet = false
@@ -27,6 +28,11 @@ struct MainStageView: View {
                 Divider().overlay(AcousticTheme.hairline)
 
                 trackStrip
+
+                if engine.sourceMode == .spotify && !spotify.isConnected && !engine.isSystemBridgeActive {
+                    Divider().overlay(AcousticTheme.hairline)
+                    spotifyQuickStrip
+                }
 
                 Divider().overlay(AcousticTheme.hairline)
 
@@ -154,6 +160,52 @@ struct MainStageView: View {
         .padding(.vertical, 10)
     }
 
+    private var spotifyQuickStrip: some View {
+        HStack(spacing: 8) {
+            Button {
+                showSettingsSheet = true
+            } label: {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Color(red: 0.114, green: 0.725, blue: 0.329))
+                        .frame(width: 6, height: 6)
+                    Text("連結 Spotify 帳號自動同步")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(AcousticTheme.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(AcousticTheme.carbonSurface, in: Capsule())
+                .overlay(Capsule().stroke(AcousticTheme.hairline, lineWidth: 0.8))
+            }
+
+            Spacer()
+
+            Button {
+                if let clip = UIPasteboard.general.string, SpotifySyncService.looksLikeSpotifyLink(clip) {
+                    engine.importSpotifyShareLink(clip, activatePiP: true)
+                } else {
+                    showSearchSheet = true
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "link")
+                        .font(.caption2.weight(.bold))
+                    Text("貼上分享連結")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(AcousticTheme.textSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(AcousticTheme.carbonSurface, in: Capsule())
+                .overlay(Capsule().stroke(AcousticTheme.hairline, lineWidth: 0.8))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 7)
+        .background(AcousticTheme.oledBlack)
+    }
+
     // MARK: - Lyrics Stage
 
     private var lyricsStage: some View {
@@ -247,23 +299,32 @@ struct MainStageView: View {
 
     private var emptyStageView: some View {
         VStack(spacing: 14) {
-            Text(engine.sourceMode == .appleMusic && engine.appleMusicAuthStatus != .authorized
-                 ? "連接 Apple Music，或直接搜尋歌詞上島"
-                 : "尚未讀取到歌詞時間軸")
+            Text(emptyHintText)
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(AcousticTheme.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 36)
 
             VStack(spacing: 10) {
-                if engine.sourceMode == .appleMusic && engine.appleMusicAuthStatus != .authorized {
+                if engine.sourceMode == .spotify && !spotify.isConnected {
+                    Button {
+                        showSettingsSheet = true
+                    } label: {
+                        Label("連結 Spotify 帳號即時同步", systemImage: "dot.radiowaves.left.and.right")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 245)
+                            .padding(.vertical, 11)
+                            .background(AcousticTheme.textPrimary, in: Capsule())
+                    }
+                } else if engine.sourceMode == .appleMusic && engine.appleMusicAuthStatus != .authorized {
                     Button {
                         engine.requestAppleMusicAccess()
                     } label: {
                         Label("授權讀取 Apple Music", systemImage: "music.note")
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(.black)
-                            .frame(width: 230)
+                            .frame(width: 245)
                             .padding(.vertical, 11)
                             .background(AcousticTheme.textPrimary, in: Capsule())
                     }
@@ -272,10 +333,10 @@ struct MainStageView: View {
                 Button {
                     showSearchSheet = true
                 } label: {
-                    Label("搜尋歌詞 / 貼上 .lrc", systemImage: "magnifyingglass")
+                    Label("搜尋歌詞 / 貼上 Spotify 連結", systemImage: "magnifyingglass")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(AcousticTheme.textPrimary)
-                        .frame(width: 230)
+                        .frame(width: 245)
                         .padding(.vertical, 11)
                         .background(AcousticTheme.carbonSurface, in: Capsule())
                         .overlay(Capsule().stroke(AcousticTheme.hairline, lineWidth: 0.9))
@@ -283,9 +344,9 @@ struct MainStageView: View {
 
                 Button {
                     engine.loadQuickTestSample(autoplay: true)
-                    engine.enableDynamicIsland()
+                    engine.toggleFloatingPiP()
                 } label: {
-                    Label("一鍵測試靈動島歌詞", systemImage: "bolt.fill")
+                    Label("一鍵測試懸浮歌詞窗", systemImage: "bolt.fill")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(accent)
                         .padding(.horizontal, 14)
@@ -295,11 +356,26 @@ struct MainStageView: View {
         }
     }
 
+    private var emptyHintText: String {
+        switch engine.sourceMode {
+        case .spotify:
+            if spotify.isConnected {
+                return "正在等待 Spotify 播放曲目…"
+            }
+            return "連結 Spotify 即時同步進度，或開啟右上「懸浮歌詞」直接疊加顯示於 Spotify 上方"
+        case .appleMusic:
+            return engine.appleMusicAuthStatus != .authorized
+                ? "授權讀取 Apple Music，或直接搜尋歌詞上島"
+                : "正在偵測 Apple Music 播放曲目…"
+        default:
+            return "尚未讀取到歌詞時間軸"
+        }
+    }
+
     // MARK: - Transport & Calibration Dock
 
     private var transportDock: some View {
         VStack(spacing: 10) {
-            // Precision Scrubber + Inline Offset Strip
             VStack(spacing: 6) {
                 GeometryReader { geo in
                     let total = max(engine.duration, 1)
@@ -338,7 +414,6 @@ struct MainStageView: View {
 
                     Spacer()
 
-                    // Tactile offset calibration pill
                     HStack(spacing: 0) {
                         Button {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -382,7 +457,6 @@ struct MainStageView: View {
                 }
             }
 
-            // Hardware Transport Row
             HStack {
                 Button {
                     showSearchSheet = true

@@ -2,67 +2,111 @@ import SwiftUI
 
 struct IslandPreviewCard: View {
     @EnvironmentObject private var engine: LyricEngine
+    @ObservedObject private var pipManager: PiPLyricOverlayManager
     @State private var previewExpanded = false
+
+    init() {
+        _pipManager = ObservedObject(wrappedValue: LyricEngine.shared.pipManager)
+    }
 
     private var accent: Color {
         AcousticTheme.accentColor(from: engine.accentColorRGB)
+    }
+
+    private var statusText: String {
+        if pipManager.isPiPActive && engine.isIslandEnabled {
+            return "懸浮窗 + 靈動島"
+        } else if pipManager.isPiPActive {
+            return "懸浮歌詞運行中"
+        } else if engine.isIslandEnabled {
+            return "靈動島運行中"
+        } else {
+            return "即時詞島待命"
+        }
     }
 
     var body: some View {
         let state = engine.buildCurrentContentState()
 
         VStack(spacing: 10) {
-            // Top minimal header strip
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
-                    Circle()
-                        .fill(engine.isIslandEnabled ? accent : AcousticTheme.textMuted)
-                        .frame(width: 6, height: 6)
-                    Text(engine.isIslandEnabled ? "即時動態運行中" : "靈動島待機")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(engine.isIslandEnabled ? AcousticTheme.textPrimary : AcousticTheme.textSecondary)
-                }
-
-                Spacer()
-
-                Button {
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
-                        previewExpanded.toggle()
-                    }
-                } label: {
-                    Text(previewExpanded ? "收合預覽" : "展開預覽")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(AcousticTheme.textSecondary)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(AcousticTheme.elevatedSurface, in: Capsule())
-                        .overlay(Capsule().stroke(AcousticTheme.hairline, lineWidth: 0.8))
-                }
-
-                Button {
-                    let generator = UIImpactFeedbackGenerator(style: .medium)
-                    generator.impactOccurred()
-                    engine.toggleDynamicIsland()
-                } label: {
-                    Text(engine.isIslandEnabled ? "關閉島上歌詞" : "啟動靈動島")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(engine.isIslandEnabled ? AcousticTheme.textPrimary : Color.black)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
-                        .background(
-                            engine.isIslandEnabled ? AnyShapeStyle(AcousticTheme.elevatedSurface) : AnyShapeStyle(AcousticTheme.textPrimary),
-                            in: Capsule()
-                        )
+                    // Live AVSampleBufferDisplayLayer host (must remain visible in hierarchy for iOS PiP)
+                    PiPBufferHostView(displayLayer: pipManager.displayLayer)
+                        .frame(width: 52, height: 19)
+                        .clipShape(Capsule())
                         .overlay(
                             Capsule().stroke(
-                                engine.isIslandEnabled ? accent.opacity(0.65) : Color.clear,
-                                lineWidth: 1
+                                pipManager.isPiPActive ? accent.opacity(0.85) : Color.white.opacity(0.16),
+                                lineWidth: 0.9
                             )
                         )
+
+                    Text(statusText)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(
+                            (pipManager.isPiPActive || engine.isIslandEnabled)
+                                ? AcousticTheme.textPrimary
+                                : AcousticTheme.textSecondary
+                        )
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                // PiP Floating Pill Toggle (overlay on top of Spotify / Home Screen)
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    engine.toggleFloatingPiP()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: pipManager.isPiPActive ? "pip.exit" : "pip.enter")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text(pipManager.isPiPActive ? "懸浮開" : "懸浮歌詞")
+                            .font(.caption.weight(.bold))
+                    }
+                    .foregroundStyle(pipManager.isPiPActive ? AcousticTheme.textPrimary : Color.black)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        pipManager.isPiPActive
+                            ? AnyShapeStyle(AcousticTheme.elevatedSurface)
+                            : AnyShapeStyle(AcousticTheme.textPrimary),
+                        in: Capsule()
+                    )
+                    .overlay(
+                        Capsule().stroke(
+                            pipManager.isPiPActive ? accent.opacity(0.75) : Color.clear,
+                            lineWidth: 1
+                        )
+                    )
+                }
+
+                // ActivityKit Dynamic Island / Lock Screen Toggle
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    engine.toggleDynamicIsland()
+                } label: {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(engine.isIslandEnabled ? accent : AcousticTheme.textMuted)
+                            .frame(width: 5.5, height: 5.5)
+                        Text(engine.isIslandEnabled ? "鎖屏開" : "靈動島")
+                            .font(.caption.weight(.bold))
+                    }
+                    .foregroundStyle(AcousticTheme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(AcousticTheme.elevatedSurface, in: Capsule())
+                    .overlay(
+                        Capsule().stroke(
+                            engine.isIslandEnabled ? accent.opacity(0.75) : AcousticTheme.hairline,
+                            lineWidth: 1
+                        )
+                    )
                 }
             }
 
-            // Hardware-proportioned Dynamic Island simulator
             Group {
                 if previewExpanded {
                     expandedSimulator(state: state)

@@ -1,6 +1,7 @@
 import Foundation
 
 enum PlaybackSourceMode: String, CaseIterable, Identifiable, Codable {
+    case spotify = "spotify"
     case appleMusic = "apple_music"
     case companion = "companion"
     case localAudio = "local_audio"
@@ -9,14 +10,16 @@ enum PlaybackSourceMode: String, CaseIterable, Identifiable, Codable {
 
     var label: String {
         switch self {
+        case .spotify: return "Spotify"
         case .appleMusic: return "Apple Music"
-        case .companion: return "外播伴侶"
+        case .companion: return "伴侶對時"
         case .localAudio: return "本機音訊"
         }
     }
 
     var shortBadge: String {
         switch self {
+        case .spotify: return "Spotify"
         case .appleMusic: return "AM 即時"
         case .companion: return "伴侶同步"
         case .localAudio: return "本機播放"
@@ -25,6 +28,7 @@ enum PlaybackSourceMode: String, CaseIterable, Identifiable, Codable {
 
     var systemImage: String {
         switch self {
+        case .spotify: return "dot.radiowaves.left.and.right"
         case .appleMusic: return "music.note"
         case .companion: return "waveform.badge.magnifyingglass"
         case .localAudio: return "folder.badge.gearshape"
@@ -33,10 +37,12 @@ enum PlaybackSourceMode: String, CaseIterable, Identifiable, Codable {
 
     var detailDescription: String {
         switch self {
+        case .spotify:
+            return "透過 Spotify 帳號直連、分享連結或系統媒體介面自動同步播放進度。"
         case .appleMusic:
             return "自動讀取系統 Apple Music 的曲目、封面與即時進度軸。"
         case .companion:
-            return "搭配 Spotify / YouTube Music / KKBOX 使用，由詞島在背景維持同步時間軸。"
+            return "搭配 YouTube Music / KKBOX / 網易雲使用，在背景維持同步時間軸。"
         case .localAudio:
             return "直接播放匯入的本機音訊檔與內嵌或外掛 LRC 歌詞。"
         }

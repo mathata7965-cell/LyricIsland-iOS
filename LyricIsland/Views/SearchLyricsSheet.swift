@@ -89,7 +89,7 @@ struct SearchLyricsSheet: View {
         }
     }
 
-    // MARK: - Online LRCLIB + iTunes Search
+    // MARK: - Online LRCLIB + Spotify Share Link + iTunes Search
 
     private var onlineSearchContent: some View {
         VStack(spacing: 12) {
@@ -98,7 +98,7 @@ struct SearchLyricsSheet: View {
                     Image(systemName: "magnifyingglass")
                         .font(.subheadline)
                         .foregroundStyle(AcousticTheme.textSecondary)
-                    TextField("輸入歌名或歌手（支援中/日/英）", text: $queryText)
+                    TextField("輸入歌名、歌手或貼上 Spotify 連結", text: $queryText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .submitLabel(.search)
@@ -141,25 +141,45 @@ struct SearchLyricsSheet: View {
             } else if results.isEmpty {
                 Spacer()
                 VStack(spacing: 12) {
-                    Text(hasSearched ? "找不到相符歌詞，請嘗試精簡關鍵字" : "搜尋任意歌曲，立即進入伴侶模式並上島")
+                    Text(hasSearched
+                         ? "找不到相符歌詞，請嘗試精簡關鍵字"
+                         : "輸入歌名搜尋，或直接貼上 Spotify「分享 → 複製連結」")
                         .font(.subheadline)
                         .foregroundStyle(AcousticTheme.textSecondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 32)
 
                     if !hasSearched {
-                        Button {
-                            engine.loadQuickTestSample(autoplay: true)
-                            engine.enableDynamicIsland()
-                            dismiss()
-                        } label: {
-                            Label("載入即時示範歌詞並上島", systemImage: "bolt.fill")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(AcousticTheme.textPrimary)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(AcousticTheme.elevatedSurface, in: Capsule())
-                                .overlay(Capsule().stroke(AcousticTheme.hairline, lineWidth: 0.8))
+                        HStack(spacing: 10) {
+                            Button {
+                                if let clip = UIPasteboard.general.string, SpotifySyncService.looksLikeSpotifyLink(clip) {
+                                    engine.importSpotifyShareLink(clip, activatePiP: true)
+                                    dismiss()
+                                } else {
+                                    engine.showToast("剪貼簿內沒有 Spotify 單曲連結")
+                                }
+                            } label: {
+                                Label("貼上 Spotify 連結", systemImage: "link")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(AcousticTheme.textPrimary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(AcousticTheme.elevatedSurface, in: Capsule())
+                                    .overlay(Capsule().stroke(AcousticTheme.hairline, lineWidth: 0.8))
+                            }
+
+                            Button {
+                                engine.loadQuickTestSample(autoplay: true)
+                                engine.toggleFloatingPiP()
+                                dismiss()
+                            } label: {
+                                Label("測試懸浮歌詞", systemImage: "bolt.fill")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.black)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(AcousticTheme.textPrimary, in: Capsule())
+                            }
                         }
                     }
                 }
@@ -168,7 +188,7 @@ struct SearchLyricsSheet: View {
                 List {
                     ForEach(results) { item in
                         Button {
-                            engine.loadSearchCandidate(item, autoplay: true, activateIsland: true)
+                            engine.loadSearchCandidate(item, autoplay: true, activateIsland: true, activatePiP: engine.pipManager.isPiPActive)
                             dismiss()
                         } label: {
                             HStack(spacing: 12) {
@@ -381,6 +401,13 @@ struct SearchLyricsSheet: View {
     private func runSearch() {
         let q = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
+
+        if SpotifySyncService.looksLikeSpotifyLink(q) {
+            engine.importSpotifyShareLink(q, activatePiP: true)
+            dismiss()
+            return
+        }
+
         isSearching = true
         hasSearched = true
         Task {

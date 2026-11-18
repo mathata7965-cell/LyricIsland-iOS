@@ -8,7 +8,7 @@ import UIKit
 final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     static let shared = LyricEngine()
 
-    @Published var sourceMode: PlaybackSourceMode = .appleMusic
+    @Published var sourceMode: PlaybackSourceMode = .spotify
     @Published var currentTrack: LyricTrack?
     @Published var currentArtwork: UIImage?
     @Published var accentColorRGB: (red: Double, green: Double, blue: Double) = ArtworkAppearance.defaultAccent
@@ -24,13 +24,19 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var isFetchingLyrics: Bool = false
     @Published var statusToast: String?
     @Published var localTracks: [LyricTrack] = []
+    @Published var isSystemBridgeActive: Bool = false
+
+    let pipManager = PiPLyricOverlayManager()
+    let spotifyService = SpotifySyncService.shared
 
     private let keepAliveService = BackgroundKeepAliveService()
     private let activityCoordinator = LiveActivityCoordinator()
     private let systemPlayer = MPMusicPlayerController.systemMusicPlayer
+    private let mediaBridge = SystemMediaRemoteBridge.shared
 
     private var localAudioPlayer: AVAudioPlayer?
     private var tickerTimer: Timer?
+    private var spotifyPollTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
     private var artworkTask: Task<Void, Never>?
     private var lyricsFetchTask: Task<Void, Never>?
@@ -38,8 +44,15 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private var cachedThumbData: Data?
     private var lastObservedSystemPersistentID: MPMediaEntityPersistentID = 0
+    private var lastObservedExternalTrackKey: String = ""
+
     private var companionAnchorDate: Date?
     private var companionAnchorElapsed: TimeInterval = 0
+
+    private var spotifyAnchorDate: Date?
+    private var spotifyAnchorElapsed: TimeInterval = 0
+    private var lastSpotifyRateLimitUntil: Date = .distantPast
+
     private var observers: [NSObjectProtocol] = []
 
     private enum DefaultsKey {
@@ -75,6 +88,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         super.init()
         loadPreferences()
         loadSavedLocalTracks()
+        wirePiPCallbacks()
         activityCoordinator.restoreExistingIfAny()
         isIslandEnabled = activityCoordinator.hasActiveActivity
         setupSystemMusicObserver()
@@ -82,12 +96,32 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         if sourceMode == .appleMusic {
             refreshAppleMusicIfAuthorized(autoPrompt: false)
+        } else if sourceMode == .spotify {
+            startSpotifyOrBridgeSyncLoop()
         }
+        pushPiPFrame()
     }
 
     deinit {
         for token in observers {
             NotificationCenter.default.removeObserver(token)
+        }
+        spotifyPollTask?.cancel()
+    }
+
+    private func wirePiPCallbacks() {
+        pipManager.onTogglePlayTapped = { [weak self] in
+            self?.togglePlayPause()
+        }
+        pipManager.onSkipBackwardTapped = { [weak self] in
+            guard let self else { return }
+            self.nudgeOffset(by: -0.5)
+            self.pipManager.showTransientBadge(String(format: "偏移 %+.1fs", self.syncOffset))
+        }
+        pipManager.onSkipForwardTapped = { [weak self] in
+            guard let self else { return }
+            self.nudgeOffset(by: 0.5)
+            self.pipManager.showTransientBadge(String(format: "偏移 %+.1fs", self.syncOffset))
         }
     }
 
@@ -111,7 +145,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func setDisplayStyle(_ style: IslandDisplayStyle) {
         displayStyle = style
         UserDefaults.standard.set(style.rawValue, forKey: DefaultsKey.displayStyle)
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     func setBackgroundKeepAlive(_ enabled: Bool) {
@@ -123,14 +157,21 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func switchSourceMode(_ mode: PlaybackSourceMode) {
         if mode == sourceMode { return }
         stopLocalAudioIfNeeded()
+        spotifyPollTask?.cancel()
         if mode != .companion {
             companionAnchorDate = nil
+        }
+        if mode != .spotify {
+            spotifyAnchorDate = nil
         }
 
         sourceMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: DefaultsKey.sourceMode)
 
         switch mode {
+        case .spotify:
+            lastObservedExternalTrackKey = ""
+            startSpotifyOrBridgeSyncLoop()
         case .appleMusic:
             lastObservedSystemPersistentID = 0
             refreshAppleMusicIfAuthorized(autoPrompt: true)
@@ -142,7 +183,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             } else {
                 currentTrack?.sourceLabel = PlaybackSourceMode.companion.shortBadge
                 companionAnchorElapsed = currentTime
-                pushLiveActivityUpdate(forceRestart: false)
+                pushOutputs(forceRestartIsland: false)
             }
         case .localAudio:
             isPlaying = false
@@ -155,7 +196,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    // MARK: - Live Activity Control
+    // MARK: - Live Activity & PiP Floating Controls
 
     func toggleDynamicIsland() {
         if isIslandEnabled {
@@ -166,12 +207,10 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func enableDynamicIsland() {
-        if currentTrack == nil {
-            loadQuickTestSample(autoplay: true)
-        }
+        ensurePlayableContentIfNeeded(autoplayCompanion: true)
         isIslandEnabled = true
         updateKeepAliveState()
-        pushLiveActivityUpdate(forceRestart: true)
+        pushOutputs(forceRestartIsland: true)
     }
 
     func disableDynamicIsland() {
@@ -179,6 +218,35 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         updateKeepAliveState()
         Task {
             await activityCoordinator.endAll()
+        }
+    }
+
+    func toggleFloatingPiP() {
+        if !pipManager.isPiPActive {
+            ensurePlayableContentIfNeeded(autoplayCompanion: true)
+        }
+        pipManager.togglePiP()
+        updateKeepAliveState()
+        pushPiPFrame()
+    }
+
+    private func ensurePlayableContentIfNeeded(autoplayCompanion: Bool) {
+        if currentTrack == nil {
+            if sourceMode == .spotify && spotifyService.isConnected {
+                Task { await pollSpotifyAndMediaRemoteOnce() }
+            } else {
+                loadQuickTestSample(autoplay: true)
+            }
+            return
+        }
+        if autoplayCompanion && !isPlaying && (sourceMode == .companion || (sourceMode == .spotify && !spotifyService.isConnected && !isSystemBridgeActive)) {
+            if currentTime >= max(duration - 0.3, 0) {
+                currentTime = 0
+            }
+            companionAnchorElapsed = currentTime
+            companionAnchorDate = Date()
+            isPlaying = true
+            recomputeActiveLine()
         }
     }
 
@@ -210,10 +278,24 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
 
         switch host {
+        case "spotify-callback":
+            Task {
+                do {
+                    try await spotifyService.handleCallbackURL(url)
+                    sourceMode = .spotify
+                    startSpotifyOrBridgeSyncLoop()
+                    showToast("Spotify 帳號已連線")
+                } catch {
+                    showToast(error.localizedDescription)
+                }
+            }
         case "start":
             enableDynamicIsland()
+        case "pip":
+            if !pipManager.isPiPActive { toggleFloatingPiP() }
         case "stop":
             disableDynamicIsland()
+            pipManager.stopPiP()
         case "sync", "search":
             let q = param("q") ?? [param("artist"), param("title")].compactMap { $0 }.joined(separator: " ")
             let autoplay = param("autoplay") != "0"
@@ -222,17 +304,236 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 return
             }
             Task {
-                isFetchingLyrics = true
-                let results = await LyricsLookupService.shared.searchInteractive(query: q)
-                isFetchingLyrics = false
-                if let best = results.first {
-                    loadSearchCandidate(best, autoplay: autoplay, activateIsland: true)
-                } else {
-                    showToast("找不到相符歌詞：\(q)")
-                }
+                await resolveAndLoadQuery(q, autoplay: autoplay, activateIsland: true)
             }
         default:
             break
+        }
+    }
+
+    // MARK: - Spotify Sync (Web API + MediaRemote + Share Links)
+
+    func connectSpotify(clientId: String) async throws {
+        try await spotifyService.authorize(clientId: clientId)
+        sourceMode = .spotify
+        UserDefaults.standard.set(PlaybackSourceMode.spotify.rawValue, forKey: DefaultsKey.sourceMode)
+        lastObservedExternalTrackKey = ""
+        startSpotifyOrBridgeSyncLoop()
+        showToast("已連結 Spotify，正在同步曲目…")
+    }
+
+    func disconnectSpotify() {
+        spotifyService.disconnect()
+        spotifyAnchorDate = nil
+        showToast("已登出 Spotify")
+    }
+
+    func importSpotifyShareLink(_ rawInput: String, activatePiP: Bool = false) {
+        Task {
+            isFetchingLyrics = true
+            defer { isFetchingLyrics = false }
+            guard let meta = await spotifyService.resolveShareLink(rawInput) else {
+                showToast("無法解析此 Spotify 連結，請確認為單曲分享連結")
+                return
+            }
+            let query = [meta.artist, meta.title].filter { !$0.isEmpty }.joined(separator: " ")
+            let results = await LyricsLookupService.shared.searchInteractive(query: query)
+            if var best = results.first {
+                if best.artworkURL == nil { best.artworkURL = meta.artworkURL }
+                loadSearchCandidate(best, autoplay: true, activateIsland: true, activatePiP: activatePiP)
+                showToast("已載入 Spotify 曲目：\(best.trackName)")
+            } else {
+                showToast("已辨識「\(meta.title)」，但 LRCLIB 尚無時間軸歌詞")
+            }
+        }
+    }
+
+    private func startSpotifyOrBridgeSyncLoop() {
+        spotifyPollTask?.cancel()
+        spotifyPollTask = Task { [weak self] in
+            while let self, !Task.isCancelled, self.sourceMode == .spotify {
+                await self.pollSpotifyAndMediaRemoteOnce()
+                let intervalNs: UInt64 = self.isPlaying ? 1_800_000_000 : 3_200_000_000
+                try? await Task.sleep(nanoseconds: intervalNs)
+            }
+        }
+    }
+
+    func pollSpotifyAndMediaRemoteOnce() async {
+        // 1. Prefer Spotify Web API when authenticated (accurate millisecond sync)
+        if spotifyService.isConnected, Date() >= lastSpotifyRateLimitUntil {
+            let result = await spotifyService.pollCurrentlyPlaying()
+            switch result {
+            case .playing(let snap):
+                applySpotifySnapshot(snap)
+                return
+            case .nothingPlaying:
+                if currentTrack?.id.hasPrefix("sp-") == true {
+                    isPlaying = false
+                    spotifyAnchorDate = nil
+                    updateKeepAliveState()
+                    pushOutputs(forceRestartIsland: false)
+                }
+            case .rateLimited(let retryAfter):
+                lastSpotifyRateLimitUntil = Date().addingTimeInterval(retryAfter)
+            case .unauthorized, .failed:
+                break
+            }
+        }
+
+        // 2. Fallback: System MediaRemote dynamic probe (works on TrollStore / unsandboxed runtimes)
+        if mediaBridge.isSupportedBinaryLoaded,
+           let sysSnap = await mediaBridge.fetchNowPlayingInfo() {
+            isSystemBridgeActive = true
+            applySystemBridgeSnapshot(sysSnap)
+        } else {
+            isSystemBridgeActive = false
+        }
+    }
+
+    private func applySpotifySnapshot(_ snap: SpotifyPlaybackSnapshot) {
+        let trackKey = "sp-\(snap.trackId)"
+        let elapsedSinceCapture = snap.isPlaying ? max(0, Date().timeIntervalSince(snap.capturedAt)) : 0
+        let liveProgress = min(snap.progress + elapsedSinceCapture, snap.duration)
+
+        if trackKey != lastObservedExternalTrackKey {
+            lastObservedExternalTrackKey = trackKey
+            duration = snap.duration
+            currentTime = liveProgress
+            spotifyAnchorElapsed = liveProgress
+            spotifyAnchorDate = snap.isPlaying ? Date() : nil
+            isPlaying = snap.isPlaying
+            syncOffset = 0
+
+            currentTrack = LyricTrack(
+                id: trackKey,
+                title: snap.title,
+                artist: snap.artist,
+                album: snap.album,
+                duration: snap.duration,
+                lines: [],
+                hasTimestamps: false,
+                artworkURL: snap.artworkURL,
+                localAudioURL: nil,
+                sourceLabel: "Spotify"
+            )
+            applyArtworkImage(nil)
+            if let artURL = snap.artworkURL {
+                loadRemoteArtwork(from: artURL)
+            }
+            recomputeActiveLine()
+            updateKeepAliveState()
+            pushOutputs(forceRestartIsland: false)
+
+            lyricsFetchTask?.cancel()
+            lyricsFetchTask = Task {
+                isFetchingLyrics = true
+                let fetched = await LyricsLookupService.shared.autoFetchSyncedLyrics(
+                    title: snap.title,
+                    artist: snap.artist,
+                    duration: snap.duration
+                )
+                guard !Task.isCancelled else { return }
+                isFetchingLyrics = false
+                if let fetched {
+                    let parsed = LRCParser.parse(fetched.lrc)
+                    if var track = currentTrack, track.id == trackKey {
+                        track.lines = parsed.lines
+                        track.hasTimestamps = parsed.hasTimestamps
+                        currentTrack = track
+                        recomputeActiveLine()
+                        pushOutputs(forceRestartIsland: false)
+                    }
+                }
+            }
+        } else {
+            duration = snap.duration
+            let predicted = spotifyAnchorDate.map { spotifyAnchorElapsed + Date().timeIntervalSince($0) } ?? currentTime
+            if abs(predicted - liveProgress) > 0.7 || snap.isPlaying != isPlaying {
+                currentTime = liveProgress
+                spotifyAnchorElapsed = liveProgress
+                spotifyAnchorDate = snap.isPlaying ? Date() : nil
+            }
+            if snap.isPlaying != isPlaying {
+                isPlaying = snap.isPlaying
+                updateKeepAliveState()
+            }
+            recomputeActiveLine()
+            pushOutputs(forceRestartIsland: false)
+        }
+    }
+
+    private func applySystemBridgeSnapshot(_ snap: SystemNowPlayingSnapshot) {
+        let trackKey = "mr-\(snap.title)-\(snap.artist)"
+        if trackKey != lastObservedExternalTrackKey {
+            lastObservedExternalTrackKey = trackKey
+            duration = snap.duration
+            currentTime = snap.elapsedTime
+            spotifyAnchorElapsed = snap.elapsedTime
+            spotifyAnchorDate = snap.isPlaying ? Date() : nil
+            isPlaying = snap.isPlaying
+            syncOffset = 0
+
+            currentTrack = LyricTrack(
+                id: trackKey,
+                title: snap.title,
+                artist: snap.artist,
+                album: snap.album,
+                duration: snap.duration,
+                lines: [],
+                hasTimestamps: false,
+                artworkURL: nil,
+                localAudioURL: nil,
+                sourceLabel: "Spotify"
+            )
+
+            if let data = snap.artworkData, let img = UIImage(data: data) {
+                applyArtworkImage(img)
+            } else {
+                applyArtworkImage(nil)
+            }
+
+            recomputeActiveLine()
+            updateKeepAliveState()
+            pushOutputs(forceRestartIsland: false)
+
+            lyricsFetchTask?.cancel()
+            lyricsFetchTask = Task {
+                isFetchingLyrics = true
+                let fetched = await LyricsLookupService.shared.autoFetchSyncedLyrics(
+                    title: snap.title,
+                    artist: snap.artist,
+                    duration: snap.duration
+                )
+                guard !Task.isCancelled else { return }
+                isFetchingLyrics = false
+                if let fetched {
+                    let parsed = LRCParser.parse(fetched.lrc)
+                    if var track = currentTrack, track.id == trackKey {
+                        track.lines = parsed.lines
+                        track.hasTimestamps = parsed.hasTimestamps
+                        currentTrack = track
+                        recomputeActiveLine()
+                        pushOutputs(forceRestartIsland: false)
+                    }
+                    if currentArtwork == nil, let artURL = fetched.artworkURL {
+                        loadRemoteArtwork(from: artURL)
+                    }
+                }
+            }
+        } else {
+            let predicted = spotifyAnchorDate.map { spotifyAnchorElapsed + Date().timeIntervalSince($0) } ?? currentTime
+            if abs(predicted - snap.elapsedTime) > 0.7 || snap.isPlaying != isPlaying {
+                currentTime = snap.elapsedTime
+                spotifyAnchorElapsed = snap.elapsedTime
+                spotifyAnchorDate = snap.isPlaying ? Date() : nil
+            }
+            if snap.isPlaying != isPlaying {
+                isPlaying = snap.isPlaying
+                updateKeepAliveState()
+            }
+            recomputeActiveLine()
+            pushOutputs(forceRestartIsland: false)
         }
     }
 
@@ -240,6 +541,28 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func togglePlayPause() {
         switch sourceMode {
+        case .spotify:
+            if spotifyService.isConnected {
+                let targetPlaying = !isPlaying
+                isPlaying = targetPlaying
+                spotifyAnchorElapsed = currentTime
+                spotifyAnchorDate = targetPlaying ? Date() : nil
+                Task {
+                    let ok = await spotifyService.sendPlaybackAction(targetPlaying ? "play" : "pause")
+                    if !ok {
+                        showToast("Spotify 裝置播放控制需 Spotify Premium 或直接於 Spotify 內操作")
+                    }
+                    try? await Task.sleep(nanoseconds: 450_000_000)
+                    await pollSpotifyAndMediaRemoteOnce()
+                }
+            } else if isSystemBridgeActive {
+                mediaBridge.sendCommand(.togglePlayPause)
+                isPlaying.toggle()
+                spotifyAnchorElapsed = currentTime
+                spotifyAnchorDate = isPlaying ? Date() : nil
+            } else {
+                toggleCompanionTimer()
+            }
         case .appleMusic:
             if systemPlayer.playbackState == .playing {
                 systemPlayer.pause()
@@ -249,22 +572,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 isPlaying = true
             }
         case .companion:
-            if currentTrack == nil {
-                loadQuickTestSample(autoplay: true)
-                return
-            }
-            if isPlaying {
-                commitCompanionTime()
-                isPlaying = false
-                companionAnchorDate = nil
-            } else {
-                if currentTime >= max(duration - 0.3, 0) {
-                    currentTime = 0
-                }
-                companionAnchorElapsed = currentTime
-                companionAnchorDate = Date()
-                isPlaying = true
-            }
+            toggleCompanionTimer()
         case .localAudio:
             guard let player = localAudioPlayer else {
                 if let track = currentTrack, track.localAudioURL != nil {
@@ -283,7 +591,26 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
         recomputeActiveLine()
         updateKeepAliveState()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
+    }
+
+    private func toggleCompanionTimer() {
+        if currentTrack == nil {
+            loadQuickTestSample(autoplay: true)
+            return
+        }
+        if isPlaying {
+            commitCompanionTime()
+            isPlaying = false
+            companionAnchorDate = nil
+        } else {
+            if currentTime >= max(duration - 0.3, 0) {
+                currentTime = 0
+            }
+            companionAnchorElapsed = currentTime
+            companionAnchorDate = Date()
+            isPlaying = true
+        }
     }
 
     func seek(to targetTime: TimeInterval) {
@@ -291,19 +618,29 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         currentTime = clamped
 
         switch sourceMode {
+        case .spotify:
+            if spotifyService.isConnected {
+                spotifyAnchorElapsed = clamped
+                if isPlaying { spotifyAnchorDate = Date() }
+                let ms = Int(clamped * 1000)
+                Task {
+                    _ = await spotifyService.sendPlaybackAction("seek", queryItems: [URLQueryItem(name: "position_ms", value: String(ms))])
+                }
+            } else {
+                companionAnchorElapsed = clamped
+                if isPlaying { companionAnchorDate = Date() }
+            }
         case .appleMusic:
             systemPlayer.currentPlaybackTime = clamped
         case .companion:
             companionAnchorElapsed = clamped
-            if isPlaying {
-                companionAnchorDate = Date()
-            }
+            if isPlaying { companionAnchorDate = Date() }
         case .localAudio:
             localAudioPlayer?.currentTime = clamped
         }
 
         recomputeActiveLine()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     func jumpToLine(_ line: LyricLine) {
@@ -311,7 +648,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             if let idx = track.lines.firstIndex(where: { $0.id == line.id }) {
                 activeLineIndex = idx
                 currentTime = line.time
-                pushLiveActivityUpdate(forceRestart: false)
+                pushOutputs(forceRestartIsland: false)
             }
             return
         }
@@ -323,24 +660,36 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard let track = currentTrack, track.hasTimestamps else { return }
         syncOffset = line.time - currentTime
         recomputeActiveLine()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
         showToast(String(format: "已對準這一句（偏移 %+.1fs）", syncOffset))
     }
 
     func nudgeOffset(by delta: TimeInterval) {
         syncOffset = max(-15, min(15, syncOffset + delta))
         recomputeActiveLine()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     func resetOffset() {
         syncOffset = 0
         recomputeActiveLine()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     func skipPrevious() {
         switch sourceMode {
+        case .spotify:
+            if spotifyService.isConnected {
+                Task {
+                    _ = await spotifyService.sendPlaybackAction("previous", method: "POST")
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    await pollSpotifyAndMediaRemoteOnce()
+                }
+            } else if isSystemBridgeActive {
+                mediaBridge.sendCommand(.previousTrack)
+            } else {
+                stepLyricLine(delta: -1)
+            }
         case .appleMusic:
             if currentTime > 4 {
                 seek(to: 0)
@@ -364,6 +713,18 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func skipNext() {
         switch sourceMode {
+        case .spotify:
+            if spotifyService.isConnected {
+                Task {
+                    _ = await spotifyService.sendPlaybackAction("next", method: "POST")
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    await pollSpotifyAndMediaRemoteOnce()
+                }
+            } else if isSystemBridgeActive {
+                mediaBridge.sendCommand(.nextTrack)
+            } else {
+                stepLyricLine(delta: 1)
+            }
         case .appleMusic:
             systemPlayer.skipToNextItem()
         case .companion:
@@ -389,10 +750,29 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     // MARK: - Loading Tracks & Lyrics
 
-    func loadSearchCandidate(_ candidate: LRCSearchCandidate, autoplay: Bool, activateIsland: Bool = false) {
+    func resolveAndLoadQuery(_ query: String, autoplay: Bool, activateIsland: Bool) async {
+        isFetchingLyrics = true
+        let results = await LyricsLookupService.shared.searchInteractive(query: query)
+        isFetchingLyrics = false
+        if let best = results.first {
+            loadSearchCandidate(best, autoplay: autoplay, activateIsland: activateIsland)
+        } else {
+            showToast("找不到相符歌詞：\(query)")
+        }
+    }
+
+    func loadSearchCandidate(
+        _ candidate: LRCSearchCandidate,
+        autoplay: Bool,
+        activateIsland: Bool = false,
+        activatePiP: Bool = false
+    ) {
         stopLocalAudioIfNeeded()
-        sourceMode = .companion
-        UserDefaults.standard.set(PlaybackSourceMode.companion.rawValue, forKey: DefaultsKey.sourceMode)
+        spotifyPollTask?.cancel()
+        if sourceMode != .companion {
+            sourceMode = .companion
+            UserDefaults.standard.set(PlaybackSourceMode.companion.rawValue, forKey: DefaultsKey.sourceMode)
+        }
 
         let rawLyrics = candidate.syncedLyrics ?? candidate.plainLyrics ?? ""
         let parsed = LRCParser.parse(rawLyrics)
@@ -426,11 +806,10 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             applyArtworkImage(nil)
         }
 
-        if activateIsland {
-            isIslandEnabled = true
-        }
+        if activateIsland { isIslandEnabled = true }
+        if activatePiP { pipManager.startPiP() }
         updateKeepAliveState()
-        pushLiveActivityUpdate(forceRestart: activateIsland)
+        pushOutputs(forceRestartIsland: activateIsland)
     }
 
     func applyCustomLyrics(_ rawText: String, title: String? = nil, artist: String? = nil) {
@@ -475,23 +854,24 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         syncOffset = 0
         recomputeActiveLine()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
         showToast(parsed.hasTimestamps ? "已載入 \(parsed.lines.count) 句時間軸歌詞" : "已載入 \(parsed.lines.count) 句純文字歌詞")
     }
 
     func loadQuickTestSample(autoplay: Bool = true) {
         stopLocalAudioIfNeeded()
+        spotifyPollTask?.cancel()
         sourceMode = .companion
         UserDefaults.standard.set(PlaybackSourceMode.companion.rawValue, forKey: DefaultsKey.sourceMode)
 
         let sampleLRC = """
         [00:00.00]靈動歌詞已就緒
-        [00:00.00]回到主畫面即可在上方膠囊預覽即時字幕
-        [00:03.20]支援 Apple Music 原生時間軸自動同步
-        [00:06.80]也支援 Spotify / YouTube Music 伴侶模式
-        [00:10.50]長按靈動島展開完整封面與互動控制
-        [00:14.20]可直接在鎖定畫面上一鍵調整 ±0.5 秒時間軸
-        [00:18.00]若為雙語 LRC 時間軸將會自動疊合翻譯行
+        [00:00.00]開啟「懸浮歌詞」即可直接疊加在 Spotify 上方
+        [00:03.20]支援 Spotify 帳號直連與分享連結秒抓詞
+        [00:06.80]同時支援 Apple Music 原生時間軸自動同步
+        [00:10.50]鎖定畫面與靈動島長按皆可控制播放與對軸
+        [00:14.20]輕點懸浮窗前進後退鍵可直接微調 ±0.5 秒
+        [00:18.00]雙語 LRC 時間軸將會自動疊合翻譯行
         [00:22.00]點左下角搜尋任意歌曲或匯入本機 .lrc 與音訊
         [00:26.50]輕觸歌詞任意一行即可立刻跳轉同步位置
         """
@@ -517,7 +897,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         isPlaying = autoplay
         activeLineIndex = 0
         updateKeepAliveState()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     // MARK: - File Import (Audio & LRC)
@@ -642,9 +1022,11 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func playLocalTrack(_ track: LyricTrack, autoplay: Bool) {
         guard let url = track.localAudioURL else { return }
         stopLocalAudioIfNeeded()
+        spotifyPollTask?.cancel()
         sourceMode = .localAudio
         UserDefaults.standard.set(PlaybackSourceMode.localAudio.rawValue, forKey: DefaultsKey.sourceMode)
         companionAnchorDate = nil
+        spotifyAnchorDate = nil
 
         do {
             configureSoloAudioSession()
@@ -666,7 +1048,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             Task { await refreshEmbeddedArtwork(for: url) }
             recomputeActiveLine()
             updateKeepAliveState()
-            pushLiveActivityUpdate(forceRestart: false)
+            pushOutputs(forceRestartIsland: false)
         } catch {
             showToast("無法播放音訊：\(error.localizedDescription)")
         }
@@ -684,7 +1066,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
         }
         applyArtworkImage(loadedImg)
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -699,7 +1081,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 self.isPlaying = false
                 self.currentTime = 0
                 self.recomputeActiveLine()
-                self.pushLiveActivityUpdate(forceRestart: false)
+                self.pushOutputs(forceRestartIsland: false)
             }
         }
     }
@@ -713,10 +1095,11 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 self.appleMusicAuthStatus = status
                 if status == .authorized {
                     self.sourceMode = .appleMusic
+                    UserDefaults.standard.set(PlaybackSourceMode.appleMusic.rawValue, forKey: DefaultsKey.sourceMode)
                     self.lastObservedSystemPersistentID = 0
                     self.syncFromAppleMusic()
                 } else {
-                    self.showToast("未取得 Apple Music 權限，可改用伴侶模式搜尋歌詞")
+                    self.showToast("未取得 Apple Music 權限，可切換至 Spotify 或伴侶對時模式")
                 }
             }
         }
@@ -768,7 +1151,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             currentTime = sysTime
         }
         recomputeActiveLine()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
     }
 
     private func syncFromAppleMusic() {
@@ -777,7 +1160,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             if currentTrack?.id.hasPrefix("am-") == true {
                 isPlaying = false
                 updateKeepAliveState()
-                pushLiveActivityUpdate(forceRestart: false)
+                pushOutputs(forceRestartIsland: false)
             }
             return
         }
@@ -793,7 +1176,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         if pid == lastObservedSystemPersistentID && currentTrack?.id == "am-\(pid)" {
             recomputeActiveLine()
             updateKeepAliveState()
-            pushLiveActivityUpdate(forceRestart: false)
+            pushOutputs(forceRestartIsland: false)
             return
         }
 
@@ -834,7 +1217,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         )
         recomputeActiveLine()
         updateKeepAliveState()
-        pushLiveActivityUpdate(forceRestart: false)
+        pushOutputs(forceRestartIsland: false)
 
         if !initialHasTimestamps {
             lyricsFetchTask?.cancel()
@@ -856,7 +1239,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                         track.artworkURL = result.artworkURL
                         currentTrack = track
                         recomputeActiveLine()
-                        pushLiveActivityUpdate(forceRestart: false)
+                        pushOutputs(forceRestartIsland: false)
                     }
                     if currentArtwork == nil, let artURL = result.artworkURL {
                         loadRemoteArtwork(from: artURL)
@@ -881,13 +1264,22 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func onTick() {
         switch sourceMode {
+        case .spotify:
+            if spotifyService.isConnected || isSystemBridgeActive {
+                if isPlaying, let anchor = spotifyAnchorDate {
+                    let elapsed = spotifyAnchorElapsed + Date().timeIntervalSince(anchor)
+                    currentTime = duration > 0 ? min(elapsed, duration) : elapsed
+                }
+            } else {
+                advanceCompanionClock()
+            }
         case .appleMusic:
             guard appleMusicAuthStatus == .authorized else { return }
             let sysPlaying = (systemPlayer.playbackState == .playing)
             if sysPlaying != isPlaying {
                 isPlaying = sysPlaying
                 updateKeepAliveState()
-                pushLiveActivityUpdate(forceRestart: false)
+                pushOutputs(forceRestartIsland: false)
             }
             if sysPlaying {
                 let t = systemPlayer.currentPlaybackTime
@@ -896,18 +1288,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 }
             }
         case .companion:
-            if isPlaying, let anchor = companionAnchorDate {
-                let elapsed = companionAnchorElapsed + Date().timeIntervalSince(anchor)
-                if duration > 0 && elapsed >= duration {
-                    currentTime = duration
-                    isPlaying = false
-                    companionAnchorDate = nil
-                    updateKeepAliveState()
-                    pushLiveActivityUpdate(forceRestart: false)
-                } else {
-                    currentTime = elapsed
-                }
-            }
+            advanceCompanionClock()
         case .localAudio:
             if let player = localAudioPlayer, player.isPlaying {
                 currentTime = player.currentTime
@@ -916,8 +1297,25 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         let prevActive = activeLineIndex
         recomputeActiveLine()
-        if prevActive != activeLineIndex && isIslandEnabled {
-            pushLiveActivityUpdate(forceRestart: false)
+        if prevActive != activeLineIndex {
+            pushOutputs(forceRestartIsland: false)
+        } else if pipManager.isPiPActive && isPlaying {
+            pushPiPFrame()
+        }
+    }
+
+    private func advanceCompanionClock() {
+        if isPlaying, let anchor = companionAnchorDate {
+            let elapsed = companionAnchorElapsed + Date().timeIntervalSince(anchor)
+            if duration > 0 && elapsed >= duration {
+                currentTime = duration
+                isPlaying = false
+                companionAnchorDate = nil
+                updateKeepAliveState()
+                pushOutputs(forceRestartIsland: false)
+            } else {
+                currentTime = elapsed
+            }
         }
     }
 
@@ -940,7 +1338,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    // MARK: - Live Activity Builder
+    // MARK: - Outputs (Dynamic Island Live Activity + PiP Floating Capsule)
 
     func buildCurrentContentState() -> LyricActivityAttributes.ContentState {
         let track = currentTrack
@@ -970,7 +1368,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
             isTranslation = false
         } else {
             currentText = track?.title ?? "詞島已待機"
-            secondaryText = isFetchingLyrics ? "正在匹配時間軸歌詞…" : "點此搜尋歌詞或連接播放"
+            secondaryText = isFetchingLyrics ? "正在匹配時間軸歌詞…" : "點此搜尋歌詞或連結 Spotify"
             isTranslation = false
         }
 
@@ -994,6 +1392,30 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
         )
     }
 
+    private func pushOutputs(forceRestartIsland: Bool) {
+        pushPiPFrame()
+        if isIslandEnabled {
+            pushLiveActivityUpdate(forceRestart: forceRestartIsland)
+        }
+    }
+
+    private func pushPiPFrame() {
+        let state = buildCurrentContentState()
+        let showSecondary = !state.secondaryLine.isEmpty && (displayStyle != .compactLyrics || state.isSecondaryTranslation)
+        pipManager.updateContent(
+            trackTitle: state.trackTitle,
+            artist: state.artistName,
+            sourceLabel: state.sourceLabel,
+            currentLine: state.currentLine,
+            secondaryLine: showSecondary ? state.secondaryLine : "",
+            artwork: currentArtwork,
+            accentRGB: accentColorRGB,
+            isPlaying: state.isPlaying,
+            elapsed: state.elapsedSeconds,
+            duration: state.durationSeconds
+        )
+    }
+
     private func pushLiveActivityUpdate(forceRestart: Bool) {
         guard isIslandEnabled else { return }
         let snapshot = buildCurrentContentState()
@@ -1010,10 +1432,9 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
     // MARK: - Audio & Keep-Alive Management
 
     private func updateKeepAliveState() {
-        let needsSilentKeepAlive = isIslandEnabled
-            && isBackgroundKeepAliveEnabled
-            && isPlaying
-            && sourceMode != .localAudio
+        let needsSilentKeepAlive = sourceMode != .localAudio && (
+            (isIslandEnabled && isBackgroundKeepAliveEnabled && isPlaying) || pipManager.isPiPActive
+        )
         keepAliveService.setKeepAliveActive(needsSilentKeepAlive)
     }
 
@@ -1040,7 +1461,7 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 let (data, _) = try await URLSession.shared.data(from: url)
                 guard !Task.isCancelled, let img = UIImage(data: data) else { return }
                 applyArtworkImage(img)
-                pushLiveActivityUpdate(forceRestart: false)
+                pushOutputs(forceRestartIsland: false)
             } catch { }
         }
     }
@@ -1109,7 +1530,6 @@ final class LyricEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 sourceLabel: PlaybackSourceMode.localAudio.shortBadge
             )
         }
-        // Populate cached lyrics synchronously on main if available
         Task {
             for idx in localTracks.indices {
                 let t = localTracks[idx]
